@@ -13,7 +13,7 @@ import neat
 import numpy as np
 import gym
 import math
-
+import configparser
 import visualize
 
 
@@ -82,6 +82,8 @@ class GaussianPolicy(object):
     def update_parameters(self, delta):
         for i, param in enumerate(self.parameters):
             self.parameters[i] = param + delta[i]
+        # clamp parameter values
+        # np.clip(self.parameters, -1, 1)
 
     def dlogPi(self, state_features, action):
         mu = np.dot(state_features, self.parameters)
@@ -137,7 +139,7 @@ class NeatAC(object):
         for gid, g in genomes:
             # create network
             network = neat.nn.FeedForwardNetwork.create(g, config)
-            neatNetwork = NeatACNetwork(network, 10) # dimension is hardcoded to be 10 for now. TODO: use config file for dimension
+            neatNetwork = NeatACNetwork(network, props.getint('neuralnet', 'dimension'))
 
             nets.append((g, neatNetwork))
             g.fitness = []
@@ -146,7 +148,7 @@ class NeatAC(object):
         for genome, net in nets:
             # run episodes
             episode_count = 0
-            MAX_EPISODES = 200
+            MAX_EPISODES = props.getint('neuralnet', 'max_episodes')
             while True:
                 state = env.reset()
                 terminal_reached = False
@@ -156,6 +158,7 @@ class NeatAC(object):
                     # get action based on a policy. I'm using random policy for now
                     action = net.get_policy().get_action(state_features)
 
+                    np.clip(action, -1, 2)
                     # take action and observe the reward and state
                     next_state, reward, done, info = env.step([action])
                     # update neural network AC parameters
@@ -178,9 +181,29 @@ class NeatAC(object):
         print(min(map(np.min, score_range)), max(map(np.max, score_range)))
 
 
-if __name__ == '__main__':
 
-    # 2 inputs and 10 outputs from NN
+def save_best_genomes(best_genomes, has_won):
+
+    for n, g in enumerate(best_genomes):
+        name = "results/"
+        if has_won:
+            name += 'winner-{0}'.format(n)
+        else:
+            name += 'best-{0}'.format(n)
+
+        with open(name + '.pickle', 'wb') as f:
+            pickle.dump(g, f)
+
+        visualize.draw_net(config, g, view=False, filename=name + "-net.gv")
+        visualize.draw_net(config, g, view=False, filename=name + "-net-enabled.gv",
+                           show_disabled=False)
+        visualize.draw_net(config, g, view=False, filename=name + "-net-enabled-pruned.gv",
+                           show_disabled=False, prune_unused=True)
+
+
+
+
+if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description=None)
     parser.add_argument('env_id', nargs='?', default='MountainCarContinuous-v0', help='Select the environment to run')
@@ -190,6 +213,7 @@ if __name__ == '__main__':
     # and configure things manually. (The default should be fine most
     # of the time.)
     gym.undo_logger_setup()
+    logging.basicConfig(filename='debug.log', level=logging.DEBUG)
     logger = logging.getLogger()
     formatter = logging.Formatter('[%(asctime)s] %(message)s')
     handler = logging.StreamHandler(sys.stderr)
@@ -198,24 +222,30 @@ if __name__ == '__main__':
 
     # You can set the level to logging.DEBUG or logging.WARN if you
     # want to change the amount of output.
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
     env = gym.make(args.env_id)
-    print("action space: {0!r}".format(env.action_space))
-    print("observation space: {0!r}".format(env.observation_space))
+    logger.debug("action space: %s", env.action_space)
+    logger.debug("observation space: %s", env.observation_space)
 
     # Limit episode time steps to cut down on training time.
     # 400 steps is more than enough time to land with a winning score.
-    print(env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps'))
+    logger.debug(env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps'))
     env.spec.tags['wrapper_config.TimeLimit.max_episode_steps'] = 400
-    print(env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps'))
+    logger.debug(env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps'))
 
     # You provide the directory to write to (can be an existing
     # directory, including one with existing data -- all monitor files
     # will be namespaced). You can also dump to a tempdir if you'd
     # like: tempfile.mkdtemp().
-    outdir = '/tmp/actor-critic-data'
+    outdir = '/tmp/neat-actor-critic-data'
     env = wrappers.Monitor(env, directory=outdir, force=True)
+
+    # load properties
+    FILENAME = 'neatac_properties.ini'
+
+    props = configparser.ConfigParser()
+    props.read(FILENAME)
 
     # run the algorithm
 
@@ -233,8 +263,8 @@ if __name__ == '__main__':
     # or the user interrupts the process.
     while 1:
         try:
-            # Run for 100 generations
-            agent.execute_algorithm(1)
+            # Run for 50 generations
+            agent.execute_algorithm(50)
 
             visualize.plot_stats(agent.stats, ylog=False, view=False, filename="fitness.svg")
 
@@ -258,26 +288,51 @@ if __name__ == '__main__':
             best_networks = []
             for g in best_genomes:
                 network = neat.nn.FeedForwardNetwork.create(g, config)
-                best_networks.append(NeatACNetwork(network, 10))
+                NeatACNetwork(network, props.getint('neuralnet', 'dimension'))
 
+            solved = True
+            best_scores = []
+            for k in range(100):
+                state = env.reset()
+                score = 0
+                while 1:
+                    # Use the total reward estimates from all five networks to
+                    # determine the best action given the current state.
+                    action_sum = 0
+                    action_count = 0
+                    for net in best_networks:
+                        # get state features
+                        state_features = net.get_network().activate(state)
+                        # get action based on a policy. I'm using random policy for now
+                        action = net.get_policy().get_action(state_features)
+                        action_sum += action
+                        action_count += 1
 
-            print("Solved.")
+                    action_avg = action_sum/action
+                    state, reward, done, info = env.step(action_avg)
+                    score += reward
+                    env.render()
+                    if done:
+                        break
 
-            # Save the winners.
-            for n, g in enumerate(best_genomes):
-                name = 'winner-{0}'.format(n)
-                with open(name + '.pickle', 'wb') as f:
-                    pickle.dump(g, f)
-
-                visualize.draw_net(config, g, view=False, filename=name + "-net.gv")
-                visualize.draw_net(config, g, view=False, filename="-net-enabled.gv",
-                                   show_disabled=False)
-                visualize.draw_net(config, g, view=False, filename="-net-enabled-pruned.gv",
-                                   show_disabled=False, prune_unused=True)
-
+                best_scores.append(score)
+                avg_score = sum(best_scores) / len(best_scores)
+                print(k, score, avg_score)
+                if avg_score < 200:
+                    solved = False
+                    break
+            if solved:
+                logger.debug("Solved")
+                # Save the winners.
+                save_best_genomes(best_genomes, True)
+                break
 
         except KeyboardInterrupt:
-            print("User break.")
+            logger.debug("User break.")
+            # save the best neural network or save top 5?
+            best_genomes = agent.stats.best_unique_genomes(5)
+
+            save_best_genomes(best_genomes, False)
             break
 
     env.close()
